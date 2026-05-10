@@ -6,9 +6,10 @@ from typing import Optional, Union
 
 import aiohttp
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
 )
@@ -25,6 +26,52 @@ API_BASE = "https://tempmail-worker.fattanafif02.workers.dev/api/public"
 
 # In-memory storage: telegram user_id -> {"cookie": str, "email": str}
 user_sessions: dict[int, dict[str, str]] = {}
+
+# In-memory history: telegram user_id -> list of previously generated emails
+user_history: dict[int, list[str]] = {}
+
+
+def main_menu_keyboard() -> InlineKeyboardMarkup:
+    """Build the main menu inline keyboard."""
+    keyboard = [
+        [
+            InlineKeyboardButton("Generate Email", callback_data="generate"),
+            InlineKeyboardButton("My Email", callback_data="mymail"),
+        ],
+        [
+            InlineKeyboardButton("Inbox", callback_data="inbox"),
+            InlineKeyboardButton("Domains", callback_data="domains"),
+        ],
+        [
+            InlineKeyboardButton("History", callback_data="history"),
+        ],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
+def after_generate_keyboard() -> InlineKeyboardMarkup:
+    """Build the keyboard shown after generating an email."""
+    keyboard = [
+        [
+            InlineKeyboardButton("Check Inbox", callback_data="inbox"),
+            InlineKeyboardButton("Generate New", callback_data="generate"),
+        ],
+        [
+            InlineKeyboardButton("Back to Menu", callback_data="menu"),
+        ],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
+def after_inbox_keyboard() -> InlineKeyboardMarkup:
+    """Build the keyboard shown after checking inbox."""
+    keyboard = [
+        [
+            InlineKeyboardButton("Refresh Inbox", callback_data="inbox"),
+            InlineKeyboardButton("Back to Menu", callback_data="menu"),
+        ],
+    ]
+    return InlineKeyboardMarkup(keyboard)
 
 
 async def api_request(
@@ -72,15 +119,16 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     welcome = (
         "Welcome to the Temp Mail Bot!\n\n"
         "I can generate temporary email addresses for you and check their inbox.\n\n"
-        "Commands:\n"
+        "Use the buttons below or type commands directly:\n"
         "/generate - Generate a new temporary email\n"
         "/newmail - Same as /generate\n"
         "/domains - Show available email domains\n"
         "/inbox - Check inbox for your current email\n"
         "/mymail - Show your current active email\n"
+        "/history - Show previously generated emails\n"
         "/help - Show this help message"
     )
-    await update.message.reply_text(welcome)
+    await update.message.reply_text(welcome, reply_markup=main_menu_keyboard())
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -93,9 +141,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/domains - List all available email domains\n"
         "/inbox - Check the inbox for your current email\n"
         "/mymail - Show your current active email address\n"
+        "/history - Show previously generated emails\n"
         "/help - Show this help message"
     )
-    await update.message.reply_text(help_text)
+    await update.message.reply_text(help_text, reply_markup=main_menu_keyboard())
 
 
 async def domains_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -113,7 +162,10 @@ async def domains_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     domain_list = "\n".join(f"  - {d}" for d in domains)
-    await update.message.reply_text(f"Available domains:\n{domain_list}")
+    await update.message.reply_text(
+        f"Available domains:\n{domain_list}",
+        reply_markup=main_menu_keyboard(),
+    )
 
 
 async def generate_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -142,10 +194,17 @@ async def generate_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     # Store the session
     user_sessions[user_id] = {"cookie": cookie or "", "email": address}
 
+    # Store in history
+    if user_id not in user_history:
+        user_history[user_id] = []
+    if address not in user_history[user_id]:
+        user_history[user_id].append(address)
+
     await update.message.reply_text(
         f"Your new temporary email address:\n\n`{address}`\n\n"
         "Use /inbox to check for incoming messages.",
         parse_mode="Markdown",
+        reply_markup=after_generate_keyboard(),
     )
 
 
@@ -157,13 +216,15 @@ async def mymail_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not session:
         await update.message.reply_text(
             "You don't have an active email address yet.\n"
-            "Use /generate to create one."
+            "Use /generate to create one.",
+            reply_markup=main_menu_keyboard(),
         )
         return
 
     await update.message.reply_text(
         f"Your current email address:\n\n`{session['email']}`",
         parse_mode="Markdown",
+        reply_markup=main_menu_keyboard(),
     )
 
 
@@ -175,32 +236,59 @@ async def inbox_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not session:
         await update.message.reply_text(
             "You don't have an active email address yet.\n"
-            "Use /generate to create one first."
+            "Use /generate to create one first.",
+            reply_markup=main_menu_keyboard(),
         )
         return
 
     email = session["email"]
     cookie = session.get("cookie")
 
+    text = await _fetch_inbox(user_id, email, cookie)
+    await update.message.reply_text(
+        text, parse_mode="Markdown", reply_markup=after_inbox_keyboard()
+    )
+
+
+async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle the /history command."""
+    user_id = update.effective_user.id
+    history = user_history.get(user_id, [])
+
+    if not history:
+        await update.message.reply_text(
+            "You haven't generated any emails yet.\n"
+            "Use /generate to create one.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    keyboard = []
+    for email in history:
+        keyboard.append(
+            [InlineKeyboardButton(email, callback_data=f"history_inbox:{email}")]
+        )
+    keyboard.append([InlineKeyboardButton("Back to Menu", callback_data="menu")])
+
+    await update.message.reply_text(
+        "Your previously generated emails:\n\nTap an email to check its inbox.",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def _fetch_inbox(user_id: int, email: str, cookie: Optional[str]) -> str:
+    """Fetch inbox for a given email and return formatted text."""
     data, new_cookie = await api_request("GET", f"/history/{email}", cookie=cookie)
 
     # Update cookie if changed
-    if new_cookie:
+    if new_cookie and user_id in user_sessions:
         user_sessions[user_id]["cookie"] = new_cookie
 
     if data is None:
-        await update.message.reply_text(
-            "Failed to fetch inbox. The API might be unavailable. Please try again later."
-        )
-        return
+        return "Failed to fetch inbox. The API might be unavailable. Please try again later."
 
     if not data:
-        await update.message.reply_text(
-            f"Inbox for `{email}` is empty.\n\n"
-            "No messages yet. Try again later.",
-            parse_mode="Markdown",
-        )
-        return
+        return f"Inbox for `{email}` is empty.\n\nNo messages yet. Try again later."
 
     # Format messages
     messages_text = f"Inbox for `{email}`:\n\n"
@@ -228,7 +316,145 @@ async def inbox_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if len(messages_text) > 4000:
         messages_text = messages_text[:4000] + "\n\n(Message truncated)"
 
-    await update.message.reply_text(messages_text, parse_mode="Markdown")
+    return messages_text
+
+
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle inline keyboard button presses."""
+    query = update.callback_query
+    await query.answer()
+
+    user_id = update.effective_user.id
+    data = query.data
+
+    if data == "menu":
+        await query.edit_message_text(
+            "What would you like to do?",
+            reply_markup=main_menu_keyboard(),
+        )
+
+    elif data == "generate":
+        api_data, cookie = await api_request("POST", "/generate", json_body={})
+        if api_data is None:
+            await query.edit_message_text(
+                "Failed to generate an email. The API might be unavailable. "
+                "Please try again later.",
+                reply_markup=main_menu_keyboard(),
+            )
+            return
+
+        address = api_data.get("address")
+        if not address:
+            await query.edit_message_text(
+                "Unexpected response from the API. Please try again later.",
+                reply_markup=main_menu_keyboard(),
+            )
+            return
+
+        # Store the session
+        user_sessions[user_id] = {"cookie": cookie or "", "email": address}
+
+        # Store in history
+        if user_id not in user_history:
+            user_history[user_id] = []
+        if address not in user_history[user_id]:
+            user_history[user_id].append(address)
+
+        await query.edit_message_text(
+            f"Your new temporary email address:\n\n`{address}`\n\n"
+            "Use /inbox or tap Check Inbox to see incoming messages.",
+            parse_mode="Markdown",
+            reply_markup=after_generate_keyboard(),
+        )
+
+    elif data == "mymail":
+        session = user_sessions.get(user_id)
+        if not session:
+            await query.edit_message_text(
+                "You don't have an active email address yet.\n"
+                "Tap 'Generate Email' to create one.",
+                reply_markup=main_menu_keyboard(),
+            )
+            return
+
+        await query.edit_message_text(
+            f"Your current email address:\n\n`{session['email']}`",
+            parse_mode="Markdown",
+            reply_markup=main_menu_keyboard(),
+        )
+
+    elif data == "inbox":
+        session = user_sessions.get(user_id)
+        if not session:
+            await query.edit_message_text(
+                "You don't have an active email address yet.\n"
+                "Tap 'Generate Email' to create one first.",
+                reply_markup=main_menu_keyboard(),
+            )
+            return
+
+        email = session["email"]
+        cookie = session.get("cookie")
+        text = await _fetch_inbox(user_id, email, cookie)
+        await query.edit_message_text(
+            text, parse_mode="Markdown", reply_markup=after_inbox_keyboard()
+        )
+
+    elif data == "domains":
+        api_data, _ = await api_request("GET", "/domains")
+        if api_data is None:
+            await query.edit_message_text(
+                "Failed to fetch domains. The API might be unavailable. "
+                "Please try again later.",
+                reply_markup=main_menu_keyboard(),
+            )
+            return
+
+        domains = api_data.get("domains", [])
+        if not domains:
+            await query.edit_message_text(
+                "No domains available at the moment.",
+                reply_markup=main_menu_keyboard(),
+            )
+            return
+
+        domain_list = "\n".join(f"  - {d}" for d in domains)
+        await query.edit_message_text(
+            f"Available domains:\n{domain_list}",
+            reply_markup=main_menu_keyboard(),
+        )
+
+    elif data == "history":
+        history = user_history.get(user_id, [])
+        if not history:
+            await query.edit_message_text(
+                "You haven't generated any emails yet.\n"
+                "Tap 'Generate Email' to create one.",
+                reply_markup=main_menu_keyboard(),
+            )
+            return
+
+        keyboard = []
+        for email in history:
+            keyboard.append(
+                [InlineKeyboardButton(email, callback_data=f"history_inbox:{email}")]
+            )
+        keyboard.append([InlineKeyboardButton("Back to Menu", callback_data="menu")])
+
+        await query.edit_message_text(
+            "Your previously generated emails:\n\nTap an email to check its inbox.",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+
+    elif data.startswith("history_inbox:"):
+        email = data[len("history_inbox:"):]
+        # Use current session cookie if available
+        session = user_sessions.get(user_id)
+        cookie = session.get("cookie") if session else None
+        text = await _fetch_inbox(user_id, email, cookie)
+        await query.edit_message_text(
+            text, parse_mode="Markdown", reply_markup=after_inbox_keyboard()
+        )
 
 
 def main() -> None:
@@ -250,6 +476,10 @@ def main() -> None:
     application.add_handler(CommandHandler("newmail", generate_command))
     application.add_handler(CommandHandler("inbox", inbox_command))
     application.add_handler(CommandHandler("mymail", mymail_command))
+    application.add_handler(CommandHandler("history", history_command))
+
+    # Register callback query handler for inline keyboard buttons
+    application.add_handler(CallbackQueryHandler(button_callback))
 
     logger.info("Bot starting...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
