@@ -12,6 +12,8 @@ from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
+    MessageHandler,
+    filters,
 )
 
 load_dotenv()
@@ -30,19 +32,23 @@ user_sessions: dict[int, dict[str, str]] = {}
 # In-memory history: telegram user_id -> list of previously generated emails
 user_history: dict[int, list[str]] = {}
 
+# In-memory state for custom email flow: telegram user_id -> {"domain": str | None}
+user_pending_custom: dict[int, dict] = {}
+
 
 def main_menu_keyboard() -> InlineKeyboardMarkup:
     """Build the main menu inline keyboard."""
     keyboard = [
         [
             InlineKeyboardButton("Generate Email", callback_data="generate"),
+            InlineKeyboardButton("Custom Email", callback_data="custom"),
+        ],
+        [
             InlineKeyboardButton("My Email", callback_data="mymail"),
-        ],
-        [
             InlineKeyboardButton("Inbox", callback_data="inbox"),
-            InlineKeyboardButton("Domains", callback_data="domains"),
         ],
         [
+            InlineKeyboardButton("Domains", callback_data="domains"),
             InlineKeyboardButton("History", callback_data="history"),
         ],
     ]
@@ -122,6 +128,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "Use the buttons below or type commands directly:\n"
         "/generate - Generate a new temporary email\n"
         "/newmail - Same as /generate\n"
+        "/custom - Create email with custom username\n"
         "/domains - Show available email domains\n"
         "/inbox - Check inbox for your current email\n"
         "/mymail - Show your current active email\n"
@@ -138,6 +145,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/generate [domain] - Generate a new temporary email address. "
         "Optionally specify a domain.\n"
         "/newmail [domain] - Same as /generate\n"
+        "/custom - Create email with custom username and domain selection\n"
         "/domains - List all available email domains\n"
         "/inbox - Check the inbox for your current email\n"
         "/mymail - Show your current active email address\n"
@@ -319,6 +327,101 @@ async def _fetch_inbox(user_id: int, email: str, cookie: Optional[str]) -> str:
     return messages_text
 
 
+async def custom_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle the /custom command - start custom email flow."""
+    user_id = update.effective_user.id
+
+    # Fetch available domains
+    data, _ = await api_request("GET", "/domains")
+    if data is None:
+        await update.message.reply_text(
+            "Failed to fetch domains. The API might be unavailable. Please try again later.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    domains = data.get("domains", [])
+    if not domains:
+        await update.message.reply_text(
+            "No domains available at the moment.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    keyboard = [
+        [InlineKeyboardButton("Random Domain", callback_data="custom_domain:random")]
+    ]
+    for domain in domains:
+        keyboard.append(
+            [InlineKeyboardButton(domain, callback_data=f"custom_domain:{domain}")]
+        )
+    keyboard.append([InlineKeyboardButton("Back to Menu", callback_data="menu")])
+
+    await update.message.reply_text(
+        "Choose a domain for your custom email:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def handle_text_input(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Handle text input from users (for custom email username)."""
+    user_id = update.effective_user.id
+
+    # Check if user has a pending custom email request
+    if user_id not in user_pending_custom:
+        return
+
+    pending = user_pending_custom.pop(user_id)
+    username = update.message.text.strip()
+
+    if not username:
+        await update.message.reply_text(
+            "Username cannot be empty. Please try again with /custom.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    # Build request body
+    body: dict = {"localPart": username}
+    if pending.get("domain"):
+        body["domain"] = pending["domain"]
+
+    data, cookie = await api_request("POST", "/generate", json_body=body)
+    if data is None:
+        await update.message.reply_text(
+            "Failed to generate the email. The API might be unavailable. "
+            "Please try again later.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    address = data.get("address")
+    if not address:
+        await update.message.reply_text(
+            "Unexpected response from the API. Please try again later.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    # Store the session
+    user_sessions[user_id] = {"cookie": cookie or "", "email": address}
+
+    # Store in history
+    if user_id not in user_history:
+        user_history[user_id] = []
+    if address not in user_history[user_id]:
+        user_history[user_id].append(address)
+
+    await update.message.reply_text(
+        f"Your new custom email address:\n\n`{address}`\n\n"
+        "Use /inbox or tap Check Inbox to see incoming messages.",
+        parse_mode="Markdown",
+        reply_markup=after_generate_keyboard(),
+    )
+
+
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle inline keyboard button presses."""
     query = update.callback_query
@@ -456,6 +559,54 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             text, parse_mode="Markdown", reply_markup=after_inbox_keyboard()
         )
 
+    elif data == "custom":
+        # Custom email flow: fetch domains and show selection
+        api_data, _ = await api_request("GET", "/domains")
+        if api_data is None:
+            await query.edit_message_text(
+                "Failed to fetch domains. The API might be unavailable. "
+                "Please try again later.",
+                reply_markup=main_menu_keyboard(),
+            )
+            return
+
+        domains = api_data.get("domains", [])
+        if not domains:
+            await query.edit_message_text(
+                "No domains available at the moment.",
+                reply_markup=main_menu_keyboard(),
+            )
+            return
+
+        keyboard = [
+            [InlineKeyboardButton("Random Domain", callback_data="custom_domain:random")]
+        ]
+        for domain in domains:
+            keyboard.append(
+                [InlineKeyboardButton(domain, callback_data=f"custom_domain:{domain}")]
+            )
+        keyboard.append([InlineKeyboardButton("Back to Menu", callback_data="menu")])
+
+        await query.edit_message_text(
+            "Choose a domain for your custom email:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+
+    elif data.startswith("custom_domain:"):
+        chosen = data[len("custom_domain:"):]
+        if chosen == "random":
+            user_pending_custom[user_id] = {"domain": None}
+            await query.edit_message_text(
+                "You chose a random domain.\n\n"
+                "Now type the username you want (the part before @):"
+            )
+        else:
+            user_pending_custom[user_id] = {"domain": chosen}
+            await query.edit_message_text(
+                f"You chose domain: {chosen}\n\n"
+                "Now type the username you want (the part before @):"
+            )
+
 
 def main() -> None:
     """Start the bot."""
@@ -474,12 +625,18 @@ def main() -> None:
     application.add_handler(CommandHandler("domains", domains_command))
     application.add_handler(CommandHandler("generate", generate_command))
     application.add_handler(CommandHandler("newmail", generate_command))
+    application.add_handler(CommandHandler("custom", custom_command))
     application.add_handler(CommandHandler("inbox", inbox_command))
     application.add_handler(CommandHandler("mymail", mymail_command))
     application.add_handler(CommandHandler("history", history_command))
 
     # Register callback query handler for inline keyboard buttons
     application.add_handler(CallbackQueryHandler(button_callback))
+
+    # Register message handler for text input (custom email username)
+    application.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input)
+    )
 
     logger.info("Bot starting...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
