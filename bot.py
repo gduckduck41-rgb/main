@@ -26,8 +26,11 @@ logger = logging.getLogger(__name__)
 
 API_BASE = "https://tempmail-worker.fattanafif02.workers.dev/api/public"
 
-# In-memory storage: telegram user_id -> {"cookie": str, "email": str}
-user_sessions: dict[int, dict[str, str]] = {}
+# In-memory storage: current active email per user
+user_current_email: dict[int, str] = {}
+
+# Cookie per email address (each email has its own session cookie)
+email_cookies: dict[str, str] = {}
 
 # In-memory history: telegram user_id -> list of previously generated emails
 user_history: dict[int, list[str]] = {}
@@ -200,7 +203,8 @@ async def generate_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
 
     # Store the session
-    user_sessions[user_id] = {"cookie": cookie or "", "email": address}
+    user_current_email[user_id] = address
+    email_cookies[address] = cookie or ""
 
     # Store in history
     if user_id not in user_history:
@@ -219,9 +223,9 @@ async def generate_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 async def mymail_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle the /mymail command."""
     user_id = update.effective_user.id
-    session = user_sessions.get(user_id)
+    email = user_current_email.get(user_id)
 
-    if not session:
+    if not email:
         await update.message.reply_text(
             "You don't have an active email address yet.\n"
             "Use /generate to create one.",
@@ -230,7 +234,7 @@ async def mymail_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     await update.message.reply_text(
-        f"Your current email address:\n\n`{session['email']}`",
+        f"Your current email address:\n\n`{email}`",
         parse_mode="Markdown",
         reply_markup=main_menu_keyboard(),
     )
@@ -239,9 +243,9 @@ async def mymail_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def inbox_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle the /inbox command."""
     user_id = update.effective_user.id
-    session = user_sessions.get(user_id)
+    email = user_current_email.get(user_id)
 
-    if not session:
+    if not email:
         await update.message.reply_text(
             "You don't have an active email address yet.\n"
             "Use /generate to create one first.",
@@ -249,10 +253,9 @@ async def inbox_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
         return
 
-    email = session["email"]
-    cookie = session.get("cookie")
+    cookie = email_cookies.get(email)
 
-    text = await _fetch_inbox(user_id, email, cookie)
+    text = await _fetch_inbox(email, cookie)
     await update.message.reply_text(
         text, parse_mode="Markdown", reply_markup=after_inbox_keyboard()
     )
@@ -284,13 +287,13 @@ async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     )
 
 
-async def _fetch_inbox(user_id: int, email: str, cookie: Optional[str]) -> str:
+async def _fetch_inbox(email: str, cookie: Optional[str]) -> str:
     """Fetch inbox for a given email and return formatted text."""
     data, new_cookie = await api_request("GET", f"/history/{email}", cookie=cookie)
 
     # Update cookie if changed
-    if new_cookie and user_id in user_sessions:
-        user_sessions[user_id]["cookie"] = new_cookie
+    if new_cookie:
+        email_cookies[email] = new_cookie
 
     if data is None:
         return "Failed to fetch inbox. The API might be unavailable. Please try again later."
@@ -406,7 +409,8 @@ async def handle_text_input(
         return
 
     # Store the session
-    user_sessions[user_id] = {"cookie": cookie or "", "email": address}
+    user_current_email[user_id] = address
+    email_cookies[address] = cookie or ""
 
     # Store in history
     if user_id not in user_history:
@@ -455,7 +459,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
 
         # Store the session
-        user_sessions[user_id] = {"cookie": cookie or "", "email": address}
+        user_current_email[user_id] = address
+        email_cookies[address] = cookie or ""
 
         # Store in history
         if user_id not in user_history:
@@ -471,8 +476,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
 
     elif data == "mymail":
-        session = user_sessions.get(user_id)
-        if not session:
+        email = user_current_email.get(user_id)
+        if not email:
             await query.edit_message_text(
                 "You don't have an active email address yet.\n"
                 "Tap 'Generate Email' to create one.",
@@ -481,14 +486,14 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
 
         await query.edit_message_text(
-            f"Your current email address:\n\n`{session['email']}`",
+            f"Your current email address:\n\n`{email}`",
             parse_mode="Markdown",
             reply_markup=main_menu_keyboard(),
         )
 
     elif data == "inbox":
-        session = user_sessions.get(user_id)
-        if not session:
+        email = user_current_email.get(user_id)
+        if not email:
             await query.edit_message_text(
                 "You don't have an active email address yet.\n"
                 "Tap 'Generate Email' to create one first.",
@@ -496,9 +501,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             )
             return
 
-        email = session["email"]
-        cookie = session.get("cookie")
-        text = await _fetch_inbox(user_id, email, cookie)
+        cookie = email_cookies.get(email)
+        text = await _fetch_inbox(email, cookie)
         await query.edit_message_text(
             text, parse_mode="Markdown", reply_markup=after_inbox_keyboard()
         )
@@ -551,10 +555,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     elif data.startswith("history_inbox:"):
         email = data[len("history_inbox:"):]
-        # Use current session cookie if available
-        session = user_sessions.get(user_id)
-        cookie = session.get("cookie") if session else None
-        text = await _fetch_inbox(user_id, email, cookie)
+        # Use the cookie associated with this specific email
+        cookie = email_cookies.get(email)
+        text = await _fetch_inbox(email, cookie)
         await query.edit_message_text(
             text, parse_mode="Markdown", reply_markup=after_inbox_keyboard()
         )
