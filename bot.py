@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import logging
+from datetime import datetime, timezone
 from typing import Optional, Union
 
 import aiohttp
@@ -104,11 +105,15 @@ async def api_request(
                 async with session.get(url, headers=headers) as resp:
                     new_cookie = _extract_cookie(resp)
                     data = await resp.json()
+                    if isinstance(data, dict) and "error" in data:
+                        logger.warning("API error response for %s: %s", endpoint, data)
                     return data, new_cookie or cookie
             else:
                 async with session.post(url, headers=headers, json=json_body) as resp:
                     new_cookie = _extract_cookie(resp)
                     data = await resp.json()
+                    if isinstance(data, dict) and "error" in data:
+                        logger.warning("API error response for %s: %s", endpoint, data)
                     return data, new_cookie or cookie
     except Exception as e:
         logger.error("API request failed: %s", e)
@@ -298,6 +303,17 @@ async def _fetch_inbox(email: str, cookie: Optional[str]) -> str:
     if data is None:
         return "Failed to fetch inbox. The API might be unavailable. Please try again later."
 
+    # Handle API error responses like {"error": "forbidden"}
+    if isinstance(data, dict) and "error" in data:
+        return (
+            f"Cannot access inbox for `{email}`.\n"
+            f"Error: {data['error']}\n\n"
+            "The session may have expired. Try generating a new email."
+        )
+
+    if not isinstance(data, list):
+        return "Unexpected response format from the API. Please try again later."
+
     if not data:
         return f"Inbox for `{email}` is empty.\n\nNo messages yet. Try again later."
 
@@ -306,8 +322,20 @@ async def _fetch_inbox(email: str, cookie: Optional[str]) -> str:
     for i, msg in enumerate(data, 1):
         subject = msg.get("subject", "(No subject)")
         sender = msg.get("from", "Unknown")
-        date = msg.get("date", "Unknown date")
-        body = msg.get("body", msg.get("text", ""))
+
+        # receivedAt is Unix timestamp in milliseconds
+        received_at = msg.get("receivedAt")
+        if received_at:
+            try:
+                dt = datetime.fromtimestamp(received_at / 1000, tz=timezone.utc)
+                date_str = dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+            except (ValueError, TypeError, OSError):
+                date_str = "Unknown date"
+        else:
+            date_str = "Unknown date"
+
+        # Body is in "text" field
+        body = msg.get("text", "")
 
         # Truncate body if too long
         if len(body) > 500:
@@ -317,7 +345,7 @@ async def _fetch_inbox(email: str, cookie: Optional[str]) -> str:
             f"--- Message {i} ---\n"
             f"From: {sender}\n"
             f"Subject: {subject}\n"
-            f"Date: {date}\n"
+            f"Date: {date_str}\n"
         )
         if body:
             messages_text += f"Body: {body}\n"
