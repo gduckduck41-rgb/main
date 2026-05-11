@@ -40,6 +40,14 @@ user_history: dict[int, list[str]] = {}
 # In-memory state for custom email flow: telegram user_id -> {"domain": str | None}
 user_pending_custom: dict[int, dict] = {}
 
+# In-memory state for claim flow: telegram user_id -> True when waiting for email input
+user_pending_claim: dict[int, bool] = {}
+
+
+def _escape_html(text: str) -> str:
+    """Escape HTML special characters for Telegram HTML parse mode."""
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
 
 def main_menu_keyboard() -> InlineKeyboardMarkup:
     """Build the main menu inline keyboard."""
@@ -53,8 +61,11 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("Inbox", callback_data="inbox"),
         ],
         [
-            InlineKeyboardButton("Domains", callback_data="domains"),
+            InlineKeyboardButton("Search Inbox", callback_data="claim"),
             InlineKeyboardButton("History", callback_data="history"),
+        ],
+        [
+            InlineKeyboardButton("Domains", callback_data="domains"),
         ],
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -138,6 +149,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "/generate - Generate a new temporary email\n"
         "/newmail - Same as /generate\n"
         "/custom - Create email with custom username\n"
+        "/claim - Search/recover inbox by email address\n"
         "/domains - Show available email domains\n"
         "/inbox - Check inbox for your current email\n"
         "/mymail - Show your current active email\n"
@@ -155,6 +167,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "Optionally specify a domain.\n"
         "/newmail [domain] - Same as /generate\n"
         "/custom - Create email with custom username and domain selection\n"
+        "/claim - Search/recover inbox by email address\n"
         "/domains - List all available email domains\n"
         "/inbox - Check the inbox for your current email\n"
         "/mymail - Show your current active email address\n"
@@ -219,9 +232,9 @@ async def generate_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         user_history[user_id].append(address)
 
     await update.message.reply_text(
-        f"Your new temporary email address:\n\n`{address}`\n\n"
+        f"Your new temporary email address:\n\n<code>{address}</code>\n\n"
         "Use /inbox to check for incoming messages.",
-        parse_mode="Markdown",
+        parse_mode="HTML",
         reply_markup=after_generate_keyboard(),
     )
 
@@ -240,8 +253,8 @@ async def mymail_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     await update.message.reply_text(
-        f"Your current email address:\n\n`{email}`",
-        parse_mode="Markdown",
+        f"Your current email address:\n\n<code>{email}</code>",
+        parse_mode="HTML",
         reply_markup=main_menu_keyboard(),
     )
 
@@ -263,7 +276,7 @@ async def inbox_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     text = await _fetch_inbox(email, cookie)
     await update.message.reply_text(
-        text, parse_mode="Markdown", reply_markup=after_inbox_keyboard()
+        text, parse_mode="HTML", reply_markup=after_inbox_keyboard()
     )
 
 
@@ -379,8 +392,8 @@ async def _fetch_inbox(email: str, cookie: Optional[str]) -> str:
     # Handle API error responses like {"error": "forbidden"}
     if isinstance(data, dict) and "error" in data:
         return (
-            f"Cannot access inbox for `{email}`.\n"
-            f"Error: {data['error']}\n\n"
+            f"Cannot access inbox for <code>{_escape_html(email)}</code>.\n"
+            f"Error: {_escape_html(data['error'])}\n\n"
             "The session may have expired. Try generating a new email."
         )
 
@@ -388,11 +401,11 @@ async def _fetch_inbox(email: str, cookie: Optional[str]) -> str:
         return "Unexpected response format from the API. Please try again later."
 
     if not data:
-        return f"Inbox for `{email}` is empty.\n\nNo messages yet. Try again later."
+        return f"Inbox for <code>{_escape_html(email)}</code> is empty.\n\nNo messages yet. Try again later."
 
     # Format messages - compact version with clickable links
     messages_text = (
-        f"Inbox for `{email}` ({len(data)} message"
+        f"Inbox for <code>{_escape_html(email)}</code> ({len(data)} message"
         f"{'s' if len(data) > 1 else ''}):\n\n"
     )
     for i, msg in enumerate(data, 1):
@@ -425,20 +438,20 @@ async def _fetch_inbox(email: str, cookie: Optional[str]) -> str:
             preview += "..."
 
         messages_text += f"--- Message {i} ---\n"
-        messages_text += f"From: {sender}\n"
-        messages_text += f"Subject: {subject}\n"
+        messages_text += f"From: {_escape_html(sender)}\n"
+        messages_text += f"Subject: {_escape_html(subject)}\n"
         messages_text += f"Date: {date_str}\n"
 
         if otp:
-            messages_text += f"\nOTP Code: `{otp}`\n"
+            messages_text += f"\n<b>OTP Code: {otp}</b>\n"
 
         if preview:
-            messages_text += f"\nPreview: {preview}\n"
+            messages_text += f"\nPreview: {_escape_html(preview)}\n"
 
         if links:
             messages_text += "\nLinks:\n"
             for link in links[:5]:  # Max 5 links per message to keep it light
-                messages_text += f"  [{link['label']}]({link['url']})\n"
+                messages_text += f'  <a href="{_escape_html(link["url"])}">{_escape_html(link["label"])}</a>\n'
 
         messages_text += "\n"
 
@@ -485,11 +498,95 @@ async def custom_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     )
 
 
+async def claim_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle the /claim command - search/recover inbox by email address."""
+    user_id = update.effective_user.id
+    user_pending_claim[user_id] = True
+    await update.message.reply_text(
+        "Type the email address you want to search/recover:\n\n"
+        "This can be an email you used before, even from a previous session."
+    )
+
+
 async def handle_text_input(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """Handle text input from users (for custom email username)."""
+    """Handle text input from users (for claim or custom email username)."""
     user_id = update.effective_user.id
+
+    # Check if user has a pending claim request (takes priority)
+    if user_id in user_pending_claim:
+        user_pending_claim.pop(user_id)
+        email_input = update.message.text.strip()
+
+        if not email_input or "@" not in email_input:
+            await update.message.reply_text(
+                "Please provide a valid email address (e.g. user@domain.com).\n"
+                "Try again with /claim.",
+                reply_markup=main_menu_keyboard(),
+            )
+            return
+
+        data, cookie = await api_request("POST", "/claim", json_body={"address": email_input})
+        if data is None:
+            await update.message.reply_text(
+                "Failed to search for that email. The API might be unavailable. "
+                "Please try again later.",
+                reply_markup=main_menu_keyboard(),
+            )
+            return
+
+        if isinstance(data, dict) and "error" in data:
+            await update.message.reply_text(
+                f"Error: {_escape_html(data['error'])}\n\n"
+                "The email address might not exist. Please check and try again.",
+                parse_mode="HTML",
+                reply_markup=main_menu_keyboard(),
+            )
+            return
+
+        address = data.get("address", email_input)
+        known = data.get("known", False)
+        history_count = data.get("historyCount", 0)
+
+        # Store the session
+        user_current_email[user_id] = address
+        if cookie:
+            email_cookies[address] = cookie
+
+        # Store in history
+        if user_id not in user_history:
+            user_history[user_id] = []
+        if address not in user_history[user_id]:
+            user_history[user_id].append(address)
+
+        if history_count > 0:
+            await update.message.reply_text(
+                f"Found <code>{_escape_html(address)}</code> with {history_count} message(s)!\n\n"
+                "Fetching inbox...",
+                parse_mode="HTML",
+            )
+            # Auto-check inbox
+            inbox_cookie = email_cookies.get(address)
+            text = await _fetch_inbox(address, inbox_cookie)
+            await update.message.reply_text(
+                text, parse_mode="HTML", reply_markup=after_inbox_keyboard()
+            )
+        elif known:
+            await update.message.reply_text(
+                f"Address <code>{_escape_html(address)}</code> is ready to receive emails.\n\n"
+                "No messages yet. Check back later with /inbox.",
+                parse_mode="HTML",
+                reply_markup=after_inbox_keyboard(),
+            )
+        else:
+            await update.message.reply_text(
+                f"Address <code>{_escape_html(address)}</code> has been claimed.\n\n"
+                "It's ready to receive emails. Check back later with /inbox.",
+                parse_mode="HTML",
+                reply_markup=after_inbox_keyboard(),
+            )
+        return
 
     # Check if user has a pending custom email request
     if user_id not in user_pending_custom:
@@ -538,9 +635,9 @@ async def handle_text_input(
         user_history[user_id].append(address)
 
     await update.message.reply_text(
-        f"Your new custom email address:\n\n`{address}`\n\n"
+        f"Your new custom email address:\n\n<code>{address}</code>\n\n"
         "Use /inbox or tap Check Inbox to see incoming messages.",
-        parse_mode="Markdown",
+        parse_mode="HTML",
         reply_markup=after_generate_keyboard(),
     )
 
@@ -588,9 +685,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             user_history[user_id].append(address)
 
         await query.edit_message_text(
-            f"Your new temporary email address:\n\n`{address}`\n\n"
+            f"Your new temporary email address:\n\n<code>{address}</code>\n\n"
             "Use /inbox or tap Check Inbox to see incoming messages.",
-            parse_mode="Markdown",
+            parse_mode="HTML",
             reply_markup=after_generate_keyboard(),
         )
 
@@ -605,8 +702,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
 
         await query.edit_message_text(
-            f"Your current email address:\n\n`{email}`",
-            parse_mode="Markdown",
+            f"Your current email address:\n\n<code>{email}</code>",
+            parse_mode="HTML",
             reply_markup=main_menu_keyboard(),
         )
 
@@ -623,7 +720,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         cookie = email_cookies.get(email)
         text = await _fetch_inbox(email, cookie)
         await query.edit_message_text(
-            text, parse_mode="Markdown", reply_markup=after_inbox_keyboard()
+            text, parse_mode="HTML", reply_markup=after_inbox_keyboard()
         )
 
     elif data == "domains":
@@ -678,7 +775,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         cookie = email_cookies.get(email)
         text = await _fetch_inbox(email, cookie)
         await query.edit_message_text(
-            text, parse_mode="Markdown", reply_markup=after_inbox_keyboard()
+            text, parse_mode="HTML", reply_markup=after_inbox_keyboard()
         )
 
     elif data == "custom":
@@ -729,6 +826,13 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 "Now type the username you want (the part before @):"
             )
 
+    elif data == "claim":
+        user_pending_claim[user_id] = True
+        await query.edit_message_text(
+            "Type the email address you want to search/recover:\n\n"
+            "This can be an email you used before, even from a previous session."
+        )
+
 
 def main() -> None:
     """Start the bot."""
@@ -748,6 +852,7 @@ def main() -> None:
     application.add_handler(CommandHandler("generate", generate_command))
     application.add_handler(CommandHandler("newmail", generate_command))
     application.add_handler(CommandHandler("custom", custom_command))
+    application.add_handler(CommandHandler("claim", claim_command))
     application.add_handler(CommandHandler("inbox", inbox_command))
     application.add_handler(CommandHandler("mymail", mymail_command))
     application.add_handler(CommandHandler("history", history_command))
