@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import logging
 from datetime import datetime, timezone
 from typing import Optional, Union
@@ -292,6 +293,78 @@ async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     )
 
 
+def _extract_links(text: str, html: str) -> list[dict[str, str]]:
+    """Extract links from email text and HTML content."""
+    links = []
+    seen_urls: set[str] = set()
+
+    # Extract from HTML: <a href="...">label</a>
+    if html:
+        for match in re.finditer(
+            r'<a[^>]+href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',
+            html,
+            re.IGNORECASE | re.DOTALL,
+        ):
+            url = match.group(1).strip()
+            label = re.sub(r"<[^>]+>", "", match.group(2)).strip()
+            if url.startswith(("http://", "https://")) and url not in seen_urls:
+                seen_urls.add(url)
+                if not label or len(label) > 60:
+                    label = _guess_link_label(url)
+                links.append({"url": url, "label": label})
+
+    # Extract bare URLs from plain text
+    if text:
+        for match in re.finditer(r'(https?://[^\s<>"\')\]]+)', text):
+            url = match.group(1).strip().rstrip(".,;:")
+            if url not in seen_urls:
+                seen_urls.add(url)
+                links.append({"url": url, "label": _guess_link_label(url)})
+
+    return links
+
+
+def _guess_link_label(url: str) -> str:
+    """Guess a friendly label for a link based on URL patterns."""
+    url_lower = url.lower()
+    if any(
+        kw in url_lower
+        for kw in ["confirm", "verify", "activate", "validation", "signup"]
+    ):
+        return "Confirm / Verify"
+    if any(kw in url_lower for kw in ["reset", "password"]):
+        return "Reset Password"
+    if any(kw in url_lower for kw in ["unsubscribe"]):
+        return "Unsubscribe"
+    if any(kw in url_lower for kw in ["login", "signin", "sign-in", "magic"]):
+        return "Login Link"
+    return "Open Link"
+
+
+def _extract_otp(text: str, subject: str) -> Optional[str]:
+    """Try to find OTP/verification code in email."""
+    combined = f"{subject} {text}"
+    patterns = [
+        r"(?:code|kode|otp|pin|token)[:\s=]+(\d{4,8})",
+        r"(\d{4,8})\s*(?:is your|adalah)",
+        r"(?:enter|masukkan|use|gunakan)[:\s]+(\d{4,8})",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, combined, re.IGNORECASE)
+        if match:
+            return match.group(1)
+
+    if any(
+        kw in subject.lower()
+        for kw in ["otp", "code", "verify", "kode", "verifikasi"]
+    ):
+        match = re.search(r"\b(\d{4,8})\b", combined)
+        if match:
+            return match.group(1)
+
+    return None
+
+
 async def _fetch_inbox(email: str, cookie: Optional[str]) -> str:
     """Fetch inbox for a given email and return formatted text."""
     data, new_cookie = await api_request("GET", f"/history/{email}", cookie=cookie)
@@ -317,8 +390,11 @@ async def _fetch_inbox(email: str, cookie: Optional[str]) -> str:
     if not data:
         return f"Inbox for `{email}` is empty.\n\nNo messages yet. Try again later."
 
-    # Format messages
-    messages_text = f"Inbox for `{email}`:\n\n"
+    # Format messages - compact version with clickable links
+    messages_text = (
+        f"Inbox for `{email}` ({len(data)} message"
+        f"{'s' if len(data) > 1 else ''}):\n\n"
+    )
     for i, msg in enumerate(data, 1):
         subject = msg.get("subject", "(No subject)")
         sender = msg.get("from", "Unknown")
@@ -328,32 +404,47 @@ async def _fetch_inbox(email: str, cookie: Optional[str]) -> str:
         if received_at:
             try:
                 dt = datetime.fromtimestamp(received_at / 1000, tz=timezone.utc)
-                date_str = dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+                date_str = dt.strftime("%Y-%m-%d %H:%M UTC")
             except (ValueError, TypeError, OSError):
-                date_str = "Unknown date"
+                date_str = "Unknown"
         else:
-            date_str = "Unknown date"
+            date_str = "Unknown"
 
-        # Body is in "text" field
-        body = msg.get("text", "")
+        text_body = msg.get("text", "")
+        html_body = msg.get("html", "")
 
-        # Truncate body if too long
-        if len(body) > 500:
-            body = body[:500] + "..."
+        # Extract OTP if present
+        otp = _extract_otp(text_body, subject)
 
-        messages_text += (
-            f"--- Message {i} ---\n"
-            f"From: {sender}\n"
-            f"Subject: {subject}\n"
-            f"Date: {date_str}\n"
-        )
-        if body:
-            messages_text += f"Body: {body}\n"
+        # Extract links from both text and HTML
+        links = _extract_links(text_body, html_body)
+
+        # Short preview of body (first 150 chars, no full dump)
+        preview = text_body.strip().replace("\n", " ")[:150]
+        if len(text_body.strip()) > 150:
+            preview += "..."
+
+        messages_text += f"--- Message {i} ---\n"
+        messages_text += f"From: {sender}\n"
+        messages_text += f"Subject: {subject}\n"
+        messages_text += f"Date: {date_str}\n"
+
+        if otp:
+            messages_text += f"\nOTP Code: `{otp}`\n"
+
+        if preview:
+            messages_text += f"\nPreview: {preview}\n"
+
+        if links:
+            messages_text += "\nLinks:\n"
+            for link in links[:5]:  # Max 5 links per message to keep it light
+                messages_text += f"  [{link['label']}]({link['url']})\n"
+
         messages_text += "\n"
 
     # Telegram has a 4096 char limit for messages
     if len(messages_text) > 4000:
-        messages_text = messages_text[:4000] + "\n\n(Message truncated)"
+        messages_text = messages_text[:4000] + "\n\n(Truncated)"
 
     return messages_text
 
